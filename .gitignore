@@ -1,0 +1,5 @@
+*.sch-bak
+firmware/mididrum.X/build/
+firmware/mididrum.X/dist/
+firmware/build
+
