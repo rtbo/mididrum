@@ -48,8 +48,8 @@ typedef union
 } MIDI_EVENT_PACKET;
 
 
-// About 50mV expressed in 10 bit space,
-#define MIN_NOTE_THRES 10
+// About 200mV expressed in 10 bit space,
+#define MIN_NOTE_THRES 41
 
 // hihat control is 5V if open, 4.5V is half, 2.5V if closed
 #define HIHAT_SEMI_THRES 930
@@ -59,8 +59,9 @@ typedef union
 
 #define VELOCITY(value) (value >> 3)
 
-// 100 ms in timer ticks
-#define TIME_NOTE_ON 7812
+// 16th note at 200 BPM is 18.75ms. We should try to catch this
+// 1400 is 17.9 ms
+#define TIME_NOTE_ON 1400
 
 #define TOM1_PITCH 50
 #define TOM2_PITCH 47
@@ -79,6 +80,7 @@ typedef enum
     NOTE_OFF,
     NOTE_WAITING_PEAK,
     NOTE_ON,
+    NOTE_SNARE_HOLD
 } NOTE_STATE;
 
 typedef enum
@@ -103,6 +105,7 @@ typedef struct
 
 typedef enum
 {
+    CRASH_PAD,
     TOM1_PAD,
     TOM2_PAD,
     TOM3_PAD,
@@ -114,7 +117,7 @@ typedef enum
 
 static PAD_NOTE regularPadNotes [NUM_REGULAR_PAD] = {
     {
-        CRASH_ADC, CRASH_LED, RIDE_PITCH, 0, 0, 0,
+        CRASH_ADC, CRASH_LED, CRASH_PITCH, 0, 0, 0,
     },
     {
         TOM1_ADC, TOM1_LED, TOM1_PITCH, 0, 0, 0,
@@ -138,6 +141,12 @@ static PAD_NOTE hihatPadNote = {
 };
 static PAD_NOTE hihatPedalNote = {
     HIHAT_PEDAL_ADC, HIHAT_PEDAL_LED, HIHAT_PEDAL_PITCH, 0, 0, 0,
+};
+static PAD_NOTE snarePadNote = {
+    SNARE_ADC, SNARE_LED, SNARE_PITCH, 0, 0, 0
+};
+static PAD_NOTE snareRimNote = {
+    SNARE_ADC, SNARE_LED, SNARE_PITCH, 0, 0, 0
 };
 
 static struct
@@ -209,6 +218,7 @@ static void ReadPedalState()
 static void HandleNote(PAD_NOTE *pn)
 {
     uint16_t value = adcValues[pn->adc];
+
     if (pn->state == NOTE_OFF && value >= MIN_NOTE_THRES) {
         pn->value = value;
         pn->state = NOTE_WAITING_PEAK;
@@ -220,21 +230,57 @@ static void HandleNote(PAD_NOTE *pn)
         else if (SendNoteOn(pn->pitch, VELOCITY(pn->value))) {
             pn->timeOn = TIMER_Get();
             pn->state = NOTE_ON;
+            IO_LedSet(pn->led, true);
         }
     }
     else if (pn->state == NOTE_ON &&
              TIMER_ElapsedSince(pn->timeOn) >= TIME_NOTE_ON) {
         if (SendNoteOff(pn->pitch)) {
-            pn->timeOn = TIMER_Get();
-            pn->state = NOTE_ON;
+            pn->state = NOTE_OFF;
+            IO_LedSet(pn->led, false);
         }
     }
+}
+
+// Snare and snare-rim can cross-talk.
+// We consider the higher value as winner, but the other one may have engaged
+// before. The following function disengage the weaker one.
+
+static void DisengageWeakSnare(PAD_NOTE *snareNote)
+{
+    if (snareNote->state == NOTE_ON && TIMER_ElapsedSince(snareNote->timeOn) >= TIME_NOTE_ON) {
+        snareNote->state = NOTE_OFF;
+        IO_LedSet(snareNote->led, false);
+    }
+    else if (snareNote->state == NOTE_WAITING_PEAK) {
+        snareNote->state = NOTE_OFF;
+    }
+}
+
+static void HandleSnare()
+{
+    if (adcValues[snarePadNote.adc] >= adcValues[snareRimNote.adc]) {
+        HandleNote(&snarePadNote);
+        DisengageWeakSnare(&snareRimNote);
+    }
+    else {
+        HandleNote(&snareRimNote);
+        DisengageWeakSnare(&snarePadNote);
+    }
+
 }
 
 static void HandleHihat()
 {
     uint8_t lastPedalState = pedalState.state;
+    uint8_t lastPedalPos = pedalState.pos;
+
     ReadPedalState();
+
+    if (lastPedalPos != pedalState.pos) {
+        IO_LedSet(HIHAT_PEDAL_LED, pedalState.pos == PEDAL_POS_CLOSED);
+    }
+
     if (hihatPadNote.state == NOTE_OFF) {
         // update pitch according to pedal and send pedal note if necessary
         if (pedalState.pos == PEDAL_POS_CLOSED) {
@@ -264,7 +310,24 @@ static void HandleHihat()
             pedalState.state = NOTE_OFF;
         }
     }
+}
 
+static void AllOff()
+{
+    for (int i = 0; i < NUM_REGULAR_PAD; ++i) {
+        regularPadNotes[i].state = NOTE_OFF;
+    }
+    hihatPadNote.state = NOTE_OFF;
+    hihatPedalNote.state = NOTE_OFF;
+    snarePadNote.state = NOTE_OFF;
+    snareRimNote.state = NOTE_OFF;
+}
+
+static void SetKitStatus(uint8_t status)
+{
+    kitState = status;
+    IO_LedSet(STATUS_ACTIVE_LED, status == KIT_ACTIVE);
+    IO_LedSet(STATUS_INACTIVE_LED, status == KIT_INACTIVE);
 }
 
 void DrumKit_Initialize()
@@ -285,29 +348,31 @@ void DrumKit_Initialize()
         IO_WaitADC();
         adcValues[c] = IO_ReadADC();
     }
-
+    AllOff();
     ReadPedalState();
 
-    kitState = KIT_INACTIVE;
+    SetKitStatus(KIT_INACTIVE);
 }
 
 void DrumKit_Activate()
 {
-    kitState = KIT_ACTIVE;
+    SetKitStatus(KIT_ACTIVE);
 }
 
 void DrumKit_Suspend()
 {
+    AllOff();
+
     IO_Suspend();
     TIMER_Suspend();
-    kitState = KIT_SUSPENDED;
+    SetKitStatus(KIT_SUSPENDED);
 }
 
 void DrumKit_Resume()
 {
     IO_Resume();
     TIMER_Resume();
-    kitState = KIT_ACTIVE;
+    SetKitStatus(KIT_ACTIVE);
 }
 
 void DrumKit_Tasks()
@@ -327,6 +392,7 @@ void DrumKit_Tasks()
     }
 
     HandleHihat();
+    HandleSnare();
 
     if (midiEvCount > 0 && !USBHandleBusy(USBTxHandle)) {
 

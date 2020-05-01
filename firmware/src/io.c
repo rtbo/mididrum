@@ -95,6 +95,5 @@ void IO_LedSet(LED led, bool on)
     case RIDE_LED:
         LATDbits.LATD6 = on;
         break;
-        +
     }
 }
